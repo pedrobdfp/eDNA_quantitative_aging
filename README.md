@@ -1,6 +1,6 @@
 # Quantitative aging of environmental DNA
 
-Code and data accompanying the manuscript *[title]* submitted to
+Code and data accompanying the manuscript *[Quantitative aging of environmental DNA using multiple components]* submitted to
 *Methods in Ecology and Evolution*.
 
 This repository reproduces every figure and parameter estimate in the main
@@ -112,4 +112,4 @@ calibration regime, wider for the field regime).
 
 ## Contact
 
-[Corresponding author name + email]
+[Corresponding author name + email redacted for peer review]
