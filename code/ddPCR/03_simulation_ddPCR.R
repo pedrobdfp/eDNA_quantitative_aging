@@ -1,0 +1,355 @@
+# =============================================================================
+# 03_simulation_ddPCR.R
+# -----------------------------------------------------------------------------
+# Simulation study for droplet_age_ddPCR.stan: the ddPCR droplet model with
+# observation error split into nested biological and technical components, both
+# shared across markers.
+#
+# DATA-GENERATING PROCESS
+#
+#   1. Decay curve, per grab i and marker j
+#          mu[i,j] = C0 + p[j] + r[j] * t[i]                (log copies / L)
+#
+#   2. Biological replicate s: a separate water sample from the same grab
+#          log C[i,j,s] = mu[i,j] + eta[s,j]        eta ~ Normal(0, sigma_bio)
+#
+#   3. Technical replicate r: a separate well from the same extract
+#          log C[i,j,r,s] = log C[i,j,s] + eps      eps ~ Normal(0, sigma_tech)
+#
+#   4. ddPCR readout, with no dropout and no false positives
+#          omega = log C[i,j,r,s] + log(vol) + log(dil) - log(550) + log(0.00085)
+#          W ~ Binomial(U, 1 - exp(-exp(omega)))
+#
+#   Only W and U reach the model. Concentration panels show layer 3, the eDNA
+#   actually delivered to each well.
+#
+# WHAT THIS CHECKS
+#   Whether sigma_bio and sigma_tech are separately recovered, and whether age
+#   posteriors are calibrated once the two levels are distinguished. A single
+#   flat error term treats wells of one sample and samples of one grab as
+#   exchangeable, so technical replication buys precision that variation shared
+#   across a sample cannot actually provide.
+#
+# FIGURES
+#   plots/ddPCR/simulation_main.png        distinct vs observed decay rates
+#   plots/ddPCR/simulation_supplement.png  noise level, marker number, rate spread
+#
+# TABLES
+#   outputs/ddPCR/simulation_recovery_main.csv   per-grab age posteriors
+#   outputs/ddPCR/simulation_calibration.csv     bias, RMSE, interval coverage
+#   outputs/ddPCR/simulation_sigma_recovery.csv  sigma_bio and sigma_tech recovery
+# =============================================================================
+
+source(here::here("code", "ddPCR", "00_setup_ddPCR.R"))
+
+set.seed(666)
+
+# =============================================================================
+# Simulation settings
+# =============================================================================
+
+Nt_main <- 30           # grabs, each with its own age
+Nt_supp <- 20           # grabs per supplementary scenario
+N_BIO   <- 3            # water samples per grab
+K_REPS  <- 3            # wells per water sample and marker
+t_max   <- 50
+
+C0_true  <- 9.0         # baseline log concentration at t = 0 (copies/L)
+VOL_TRUE <- 3.0         # litres filtered
+U_TRUE   <- 20000L      # accepted droplets per well
+DIL_TRUE <- 1
+
+r_actual <- unname(r_by_marker[locus_levels])
+p_true   <- unname(p_by_marker[locus_levels])
+
+# Noise levels measured in the field samples, defined in 00_setup_ddPCR.R.
+# sigma_tech is the SD between wells of one water sample, sigma_bio the SD
+# between water samples of one grab.
+SIGMA_TECH_MAIN <- SIGMA_LEVELS$tech
+SIGMA_BIO_MAIN  <- SIGMA_LEVELS$bio_field
+
+message("Simulation settings:")
+message("  ", Nt_main, " grabs x ", N_BIO, " water samples x ", K_REPS,
+        " wells x ", length(r_actual), " markers")
+message("  sigma_bio = ", SIGMA_BIO_MAIN, " | sigma_tech = ", SIGMA_TECH_MAIN)
+
+# =============================================================================
+# Generative model
+# =============================================================================
+
+simulate_data <- function(r_true, p_local, sigma_bio, sigma_tech,
+                          C0 = C0_true, vol = VOL_TRUE, U = U_TRUE,
+                          dil = DIL_TRUE, Nt_local = Nt_main,
+                          n_bio = N_BIO, n_tech = K_REPS,
+                          t_max_local = t_max, seed_sim = 666) {
+  set.seed(seed_sim)
+  K_local <- length(r_true)
+  t_local <- seq(0.5, t_max_local, length.out = Nt_local)
+  off     <- droplet_log_offset(vol, dil)
+
+  obs <- expand.grid(obs_i = seq_len(Nt_local),
+                     bio   = seq_len(n_bio),
+                     obs_j = seq_len(K_local),
+                     rep   = seq_len(n_tech))
+  obs$t_true <- t_local[obs$obs_i]
+
+  # a biological replicate is identified by grab and sample number
+  obs$sample_id <- paste(obs$obs_i, obs$bio, sep = "_")
+
+  # 1. decay curve
+  obs$mu <- C0 + p_local[obs$obs_j] + r_true[obs$obs_j] * obs$t_true
+
+  # 2. biological replicate: one deviate per (water sample, marker)
+  eta <- matrix(rnorm(Nt_local * n_bio * K_local, 0, sigma_bio),
+                nrow = Nt_local * n_bio, ncol = K_local,
+                dimnames = list(unique(obs$sample_id), NULL))
+  obs$logC_bio <- obs$mu + eta[cbind(match(obs$sample_id, rownames(eta)),
+                                     obs$obs_j)]
+
+  # 3. technical replicate: one deviate per well
+  obs$logC <- rnorm(nrow(obs), obs$logC_bio, sigma_tech)
+
+  # 4. ddPCR readout
+  obs$lambda     <- exp(obs$logC + off)
+  obs$accepted   <- U
+  obs$positives  <- rbinom(nrow(obs), U, 1 - exp(-obs$lambda))
+  obs$log_offset <- off
+
+  list(obs = obs, t_local = t_local,
+       sigma_bio = sigma_bio, sigma_tech = sigma_tech)
+}
+
+simulate_and_fit <- function(r_true, sigma_bio = SIGMA_BIO_MAIN,
+                             sigma_tech = SIGMA_TECH_MAIN, p_local = NULL,
+                             seed_sim = 666, seed_stan = 42,
+                             t_mean = 24, t_sd = 24, Nt_local = Nt_main) {
+  K_local <- length(r_true)
+  if (is.null(p_local)) {
+    p_local <- c(p_true, rep(0, max(0, K_local - length(p_true))))[seq_len(K_local)]
+  }
+  sim <- simulate_data(r_true, p_local, sigma_bio, sigma_tech,
+                       Nt_local = Nt_local, seed_sim = seed_sim)
+
+  stan_data <- build_droplet_stan_data(
+    obs = sim$obs, Nt = length(sim$t_local), Nloci = K_local,
+    r_vec = r_true, p_vec = p_local,
+    C0_mean = C0_true, C0_sd = 1.8, t_mean = t_mean, t_sd = t_sd,
+    bio = sim$obs$sample_id)
+
+  fit <- stan(file = stan_droplet_age, data = stan_data,
+              chains = 4, iter = 2000, warmup = 1000, seed = seed_stan,
+              control = list(adapt_delta = 0.95, max_treedepth = 12),
+              refresh = 200)
+
+  list(fit = fit, sim = sim, t_local = sim$t_local,
+       p_local = p_local, r_true = r_true)
+}
+
+# =============================================================================
+# Summaries
+# =============================================================================
+
+recovery_table <- function(res, label) {
+  ts <- summary(res$fit, pars = "t",
+                probs = c(0.025, 0.25, 0.5, 0.75, 0.975))$summary
+  data.frame(scenario = label, true = res$t_local,
+             med = ts[, "50%"], mean = ts[, "mean"], sd = ts[, "sd"],
+             lo95 = ts[, "2.5%"], hi95 = ts[, "97.5%"],
+             lo50 = ts[, "25%"],  hi50 = ts[, "75%"],
+             row.names = NULL)
+}
+
+# Both variance components against the values used to simulate
+sigma_table <- function(res, label) {
+  ss <- summary(res$fit, pars = c("sigma_bio", "sigma_tech"),
+                probs = c(0.025, 0.5, 0.975))$summary
+  data.frame(scenario = label,
+             component  = c("sigma_bio", "sigma_tech"),
+             true       = c(res$sim$sigma_bio, res$sim$sigma_tech),
+             estimate   = ss[, "mean"],
+             lo95       = ss[, "2.5%"],
+             hi95       = ss[, "97.5%"],
+             covered    = c(res$sim$sigma_bio, res$sim$sigma_tech) >= ss[, "2.5%"] &
+                          c(res$sim$sigma_bio, res$sim$sigma_tech) <= ss[, "97.5%"],
+             row.names  = NULL)
+}
+
+calib_row <- function(rt, res, label) {
+  div <- sum(sapply(rstan::get_sampler_params(res$fit, inc_warmup = FALSE),
+                    function(x) sum(x[, "divergent__"])))
+  data.frame(scenario = label, n = nrow(rt),
+             zero_wells = mean(res$sim$obs$positives == 0),
+             bias = mean(rt$med - rt$true),
+             mae  = mean(abs(rt$med - rt$true)),
+             rmse = sqrt(mean((rt$med - rt$true)^2)),
+             cover50 = mean(rt$true >= rt$lo50 & rt$true <= rt$hi50),
+             cover95 = mean(rt$true >= rt$lo95 & rt$true <= rt$hi95),
+             ci95_med = median(rt$hi95 - rt$lo95),
+             divergences = div,
+             max_rhat = max(summary(res$fit, pars = "t")$summary[, "Rhat"],
+                            na.rm = TRUE))
+}
+
+regime_check <- function(sim_obs) {
+  f <- here("data", "field_droplets.csv")
+  if (!file.exists(f)) return(invisible(NULL))
+  d <- read.csv(f, stringsAsFactors = FALSE)
+  message("\nSimulated wells vs field wells:")
+  message("  field     : zero fraction ", round(mean(d$positives == 0), 3),
+          " | median W (detected) ", median(d$positives[d$positives > 0]))
+  message("  simulated : zero fraction ", round(mean(sim_obs$positives == 0), 3),
+          " | median W (detected) ",
+          median(sim_obs$positives[sim_obs$positives > 0]))
+  invisible(NULL)
+}
+
+# =============================================================================
+# Figure panels
+# =============================================================================
+
+plot_concentrations <- function(res, component_labels, title_str) {
+  K_local <- length(component_labels)
+  res$sim$obs %>%
+    mutate(Components = factor(obs_j, levels = seq_len(K_local),
+                               labels = component_labels),
+           y_plot = ifelse(positives > 0, logC, NA_real_)) %>%
+    ggplot(aes(x = t_true, y = y_plot, color = Components)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", se = FALSE, na.rm = TRUE) +
+    labs(title = title_str, x = "Time elapsed",
+         y = "Log simulated eDNA concentration", color = "Components") +
+    theme_bw(base_size = 12) +
+    scale_color_brewer(palette = "Set2") +
+    theme(legend.position = "right",
+          plot.title = element_text(hjust = 0.5, size = 16),
+          axis.title = element_text(size = 14))
+}
+
+plot_t_recovery <- function(res, title_str) {
+  rt <- recovery_table(res, "")
+  ggplot(rt, aes(x = true, y = med)) +
+    geom_abline(slope = 1, linetype = "dashed", color = "red") +
+    geom_linerange(aes(ymin = lo95, ymax = hi95),
+                   colour = "#2166ac", linewidth = 0.6, alpha = 0.5) +
+    geom_linerange(aes(ymin = lo50, ymax = hi50),
+                   colour = "#2166ac", linewidth = 1.4) +
+    geom_point(size = 2.5, colour = "#2166ac") +
+    labs(title = title_str, x = "True time elapsed",
+         y = "Estimated time elapsed") +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5, size = 16),
+          axis.title = element_text(size = 14))
+}
+
+rate_labels_for <- function(r_vec, digits = 3) {
+  paste0(seq_along(r_vec), " (λ = ",
+         sprintf(paste0("%.", digits, "f"), r_vec), ")")
+}
+
+# =============================================================================
+# Main figure
+# =============================================================================
+
+message("\nRun 1: distinct decay rates")
+r_distinct <- c(-0.05, -0.10, -0.20, -0.40)
+res1 <- simulate_and_fit(r_distinct, seed_sim = 66, seed_stan = 42)
+message("  non-detection rate: ", round(mean(res1$sim$obs$positives == 0), 3))
+
+message("\nRun 2: decay rates observed in the carboy experiment")
+res2 <- simulate_and_fit(r_actual, seed_sim = 66, seed_stan = 123)
+message("  non-detection rate: ", round(mean(res2$sim$obs$positives == 0), 3))
+regime_check(res2$sim$obs)
+
+simulation_main <- plot_grid(
+  plot_concentrations(res2, rate_labels_for(r_actual, 3),
+                      "Components (actual rates)"),
+  plot_t_recovery(res2, "Model age estimation (actual rates)"),
+  plot_concentrations(res1, rate_labels_for(r_distinct, 2),
+                      "Components (distinct rates)"),
+  plot_t_recovery(res1, "Model age estimation (distinct rates)"),
+  labels = c("(a)", "(b)", "(c)", "(d)"), label_size = 16)
+
+ggsave(plot_path("simulation_main.png"), plot = simulation_main,
+       width = 12, height = 9, dpi = 300)
+message("Saved: plots/ddPCR/simulation_main.png")
+
+rec_main <- bind_rows(recovery_table(res1, "distinct rates"),
+                      recovery_table(res2, "actual rates"))
+write.csv(rec_main, out_path("simulation_recovery_main.csv"), row.names = FALSE)
+
+calib <- bind_rows(calib_row(recovery_table(res1, "distinct"), res1, "distinct rates"),
+                   calib_row(recovery_table(res2, "actual"),   res2, "actual rates"))
+sig   <- bind_rows(sigma_table(res1, "distinct rates"),
+                   sigma_table(res2, "actual rates"))
+
+message("\nVariance components, simulated versus estimated:")
+print(as.data.frame(sig %>% mutate(across(where(is.numeric), ~round(.x, 3)))))
+
+# =============================================================================
+# Supplementary figure
+# =============================================================================
+# Panels 1-3 hold the decay rates at their observed values and vary the amount
+# of biological variation. Panels 4-6 hold noise fixed and vary the number of
+# markers and the spread of their decay rates.
+
+supp_scenarios <- list(
+  list(r = r_actual, sb = SIGMA_LEVELS$bio_low, st = SIGMA_TECH_MAIN,
+       lab = "low biological variation"),
+  list(r = r_actual, sb = SIGMA_LEVELS$bio_field, st = SIGMA_TECH_MAIN,
+       lab = "observed biological variation"),
+  list(r = r_actual, sb = SIGMA_LEVELS$bio_high, st = SIGMA_TECH_MAIN,
+       lab = "high biological variation"),
+  list(r = c(-0.10, -0.12), sb = SIGMA_BIO_MAIN, st = SIGMA_TECH_MAIN,
+       lab = "2 markers, similar rates"),
+  list(r = c(-0.10, -0.20, -0.50), sb = SIGMA_BIO_MAIN, st = SIGMA_TECH_MAIN,
+       lab = "3 markers"),
+  list(r = c(-0.05, -0.10, -0.15, -0.20, -0.40, -0.80),
+       sb = SIGMA_BIO_MAIN, st = SIGMA_TECH_MAIN, lab = "6 markers")
+)
+
+run_supp <- function(s, seed = 13) {
+  res <- simulate_and_fit(s$r, sigma_bio = s$sb, sigma_tech = s$st,
+                          seed_sim = seed, seed_stan = seed,
+                          t_mean = 20, t_sd = 15, Nt_local = Nt_supp)
+  labs <- rate_labels_for(s$r, 2)
+  list(res    = res,
+       top    = plot_concentrations(res, labs, paste0("Components (", s$lab, ")")),
+       bottom = plot_t_recovery(res, paste0("Age estimation (", s$lab, ")")),
+       calib  = calib_row(recovery_table(res, s$lab), res, s$lab),
+       sigma  = sigma_table(res, s$lab))
+}
+
+supp_res <- lapply(supp_scenarios, run_supp)
+
+simulation_supp <- plot_grid(
+  plotlist = list(supp_res[[1]]$top,    supp_res[[2]]$top,    supp_res[[3]]$top,
+                  supp_res[[1]]$bottom, supp_res[[2]]$bottom, supp_res[[3]]$bottom,
+                  supp_res[[4]]$top,    supp_res[[5]]$top,    supp_res[[6]]$top,
+                  supp_res[[4]]$bottom, supp_res[[5]]$bottom, supp_res[[6]]$bottom),
+  ncol = 3, labels = paste0("(", letters[1:12], ")"), label_size = 16)
+
+ggsave(plot_path("simulation_supplement.png"), plot = simulation_supp,
+       width = 14, height = 16, dpi = 300)
+message("Saved: plots/ddPCR/simulation_supplement.png")
+
+calib <- bind_rows(calib, bind_rows(lapply(supp_res, `[[`, "calib")))
+sig   <- bind_rows(sig,   bind_rows(lapply(supp_res, `[[`, "sigma")))
+
+# =============================================================================
+# Report
+# =============================================================================
+
+write.csv(calib, out_path("simulation_calibration.csv"),    row.names = FALSE)
+write.csv(sig,   out_path("simulation_sigma_recovery.csv"), row.names = FALSE)
+
+message("\nVariance components across all scenarios:")
+print(as.data.frame(sig %>% mutate(across(where(is.numeric), ~round(.x, 3)))))
+message("95% interval coverage of the true values: ", round(mean(sig$covered), 3))
+
+message("\nAge recovery across all scenarios:")
+print(as.data.frame(calib %>% mutate(across(where(is.numeric), ~round(.x, 3)))))
+
+message("\nSaved: outputs/ddPCR/simulation_calibration.csv")
+message("       outputs/ddPCR/simulation_sigma_recovery.csv")
+message("       outputs/ddPCR/simulation_recovery_main.csv")
