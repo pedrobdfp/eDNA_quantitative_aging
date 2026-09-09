@@ -16,8 +16,8 @@ several markers from the same organism changes systematically with time since
 shedding. That relative abundance is informative about age independently of the
 absolute quantity released, which is rarely known.
 
-The model has a single process equation. For unit *i* — a water sample, or a set
-of water samples collected together — and marker *j*:
+The model has a single process equation. For unit *i*, a water sample or a set
+of water samples collected together, and marker *j*:
 
 ```
 log C[i,j]  =  C[i]  +  p[j]  +  r[j] * t[i]
@@ -46,7 +46,7 @@ widens the age posterior without displacing it.
 ## Two observation models
 
 The process equation and the error structure are identical in both. They differ
-in what is read from the instrument.
+in what format the tata is input.
 
 **`code/ddPCR/`** — droplet model, used in the manuscript. Takes the number of
 positive droplets out of the number accepted, per well, and models them as
