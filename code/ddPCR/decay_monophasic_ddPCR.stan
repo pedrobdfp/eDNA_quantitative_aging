@@ -1,11 +1,11 @@
 // =============================================================================
 // decay_monophasic_ddPCR.stan
 //
-// HOW FAST DOES EACH MARKER DECAY? Estimating decay rates from a controlled
-// experiment, using ddPCR droplet counts.
+// Marker-specific first-order decay rates, estimated from a controlled
+// experiment using ddPCR droplet counts.
 // -----------------------------------------------------------------------------
 //
-// WHAT THIS IS FOR
+// PURPOSE
 //
 //   The age model (droplet_age_ddPCR.stan) needs to know two things about each
 //   marker before it can date anything: how quickly the marker disappears, and
@@ -39,7 +39,7 @@
 //   are given no special treatment, so C0 really is just the intercept of the
 //   fitted line.
 //
-// FROM CONCENTRATION TO WHAT THE MACHINE REPORTS
+// OBSERVATION MODEL
 //
 //       omega[n] = log C[n] + log_offset[n] + sigma_obs * eps[n] - sigma_obs^2/2
 //       W[n] ~ Binomial(U[n], 1 - exp(-exp(omega[n])))
@@ -59,7 +59,7 @@
 //   across markers this correction is one constant and cannot bend the decay
 //   rates.
 //
-// WHAT THIS FILE HANDS TO THE AGE MODEL
+// QUANTITIES PASSED TO THE AGE MODEL
 //
 //   r      the decay rates written as negative numbers, which is the sign
 //          convention the age model expects
@@ -71,12 +71,12 @@
 
 
 data {
-  // ---- Sizes ---------------------------------------------------------------
+  // ---- Dimensions ---------------------------------------------------------
   int<lower=1> N;                        // number of PCR wells
   int<lower=1> N_series;                 // carboy x marker combinations
   int<lower=1> N_marker;                 // number of markers
 
-  // ---- The observations, one row per well ----------------------------------
+  // ---- Observations: one row per ddPCR well -------------------------------
   array[N] int<lower=1, upper=N_series> series;   // which series this well belongs to
   array[N] int<lower=1, upper=N_marker> marker;   // which marker it measured
   vector<lower=0>[N] time;                        // hours since the carboys were filled
@@ -84,10 +84,10 @@ data {
   array[N] int<lower=0> W;                        // droplets that were positive
   array[N] int<lower=1> U;                        // droplets the reader accepted
 
-  // ---- Which marker each series belongs to, for the summaries below --------
+  // ---- Marker of each series, used for the per-marker summaries -----------
   array[N_series] int<lower=1, upper=N_marker> series_marker;
 
-  // ---- Prior settings, chosen in R -----------------------------------------
+  // ---- Prior hyperparameters ----------------------------------------------
   real<lower=0> sigma_obs_sd;            // scale of the prior on well-to-well spread
   real<lower=0> lambda_sd;               // scale of the prior on the decay rates
   real C0_mean;                          // expected starting log concentration
@@ -126,13 +126,13 @@ transformed parameters {
 
 
 model {
-  // ---- What we believe before seeing the data ------------------------------
+  // ---- Priors -------------------------------------------------------------
   C0        ~ normal(C0_mean, C0_sd);
   lambda    ~ normal(0, lambda_sd);      // half-normal: lambda cannot be negative
-  sigma_obs ~ normal(0, sigma_obs_sd);   // likewise
+  sigma_obs ~ normal(0, sigma_obs_sd);   // half-normal
   eps_raw   ~ std_normal();
 
-  // ---- What the data say ---------------------------------------------------
+  // ---- Likelihood ---------------------------------------------------------
   W ~ binomial(U, inv_cloglog(omega));
 }
 

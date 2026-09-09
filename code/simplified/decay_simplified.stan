@@ -1,11 +1,11 @@
 // =============================================================================
 // decay_simplified.stan
 //
-// HOW FAST DOES EACH MARKER DECAY? Estimating decay rates from a controlled
-// experiment, using concentration measurements. Works with qPCR or digital PCR.
+// Marker-specific first-order decay rates, estimated from a controlled
+// experiment using concentration measurements.
 // -----------------------------------------------------------------------------
 //
-// WHAT THIS IS FOR
+// PURPOSE
 //
 //   The age model (conc_age_simplified.stan) needs to know two things about
 //   each marker before it can date anything: how quickly the marker
@@ -18,10 +18,10 @@
 //   estimated. The same observation model is used in both, so the rates are
 //   measured under the same likelihood that later consumes them.
 //
-//   To run this on your own system: fill a vessel with water containing your
-//   target, keep it under conditions resembling the field, and subsample it
-//   several times over a period long enough for a clear decline. Denser
-//   sampling early is worth more than a few distant points.
+//   To characterise a new system: hold water containing the target in a
+//   sealed vessel under conditions resembling the field and subsample it
+//   over a period long enough to observe a clear decline. Denser sampling
+//   early is more informative than a few distant timepoints.
 //
 // THE PROCESS MODEL
 //
@@ -39,7 +39,7 @@
 //               positive and subtracted, so a larger lambda means faster loss.
 //       time    hours since the start of the experiment, known
 //
-// WHAT THE MODEL DOES WITH YOUR MEASUREMENTS
+// OBSERVATION MODEL
 //
 //       z[n] ~ Bernoulli(logit^-1(beta * (log C[n] - logC50)))
 //       y[n] ~ Normal(log C[n], sigma_obs)                    where z = 1
@@ -60,7 +60,7 @@
 //   there. The equivalent intercept of the more familiar alpha + beta * log C
 //   form is alpha = -beta * logC50 and is reported below.
 //
-// WHAT THIS FILE HANDS TO THE AGE MODEL
+// QUANTITIES PASSED TO THE AGE MODEL
 //
 //   r      the decay rates written as negative numbers, which is the sign
 //          convention the age model expects
@@ -72,26 +72,26 @@
 
 
 data {
-  // ---- Sizes ---------------------------------------------------------------
+  // ---- Dimensions ---------------------------------------------------------
   int<lower=1> N;                        // number of PCR replicates
   int<lower=1> N_ik;                     // vessel x marker combinations
   int<lower=1> N_k;                      // number of markers
 
-  // ---- Every replicate, detected or not ------------------------------------
+  // ---- Observations: one row per PCR replicate ----------------------------
   array[N] int<lower=1, upper=N_ik> ik;  // which vessel-and-marker this belongs to
   array[N] int<lower=1, upper=N_k>  k;   // which marker it measured
   vector[N] time;                        // hours since the start of the experiment
   array[N] int<lower=0, upper=1> z;      // 1 if it amplified, 0 if not
 
-  // ---- The subset that produced a number -----------------------------------
+  // ---- Detected replicates only -------------------------------------------
   int<lower=0> N_y;                      // how many replicates detected something
   array[N_y] int<lower=1, upper=N> y_row;   // their position in the list above
   vector[N_y] y_obs;                        // their measurements, log copies per litre
 
-  // ---- Which marker each vessel-and-marker combination belongs to ----------
+  // ---- Marker of each vessel-by-marker combination ------------------------
   array[N_ik] int<lower=1, upper=N_k> ik_to_k;
 
-  // ---- Prior settings, chosen in R -----------------------------------------
+  // ---- Prior hyperparameters ----------------------------------------------
   real C0_mean;                          // expected starting log concentration
   real<lower=0> C0_sd;                   // how uncertain that expectation is
   real logC50_mean;                      // expected limit of detection, log scale
@@ -101,7 +101,7 @@ data {
   real<lower=0> sigma_sd;                // scale of the prior on the observation spread
   real<lower=0> lambda_sd;               // scale of the prior on the decay rates
 
-  // ---- Times at which to report a fitted decay curve, for plotting ---------
+  // ---- Prediction grid for the fitted decay curve -------------------------
   int<lower=0> N_time_sim;
   vector[N_time_sim] time_sim;
 }
@@ -126,14 +126,14 @@ transformed parameters {
 
 
 model {
-  // ---- What we believe before seeing the data ------------------------------
+  // ---- Priors -------------------------------------------------------------
   C0        ~ normal(C0_mean, C0_sd);
   lambda    ~ normal(0, lambda_sd);      // half-normal: lambda cannot be negative
   logC50    ~ normal(logC50_mean, logC50_sd);
   beta      ~ normal(beta_mean, beta_sd);   // half-normal
   sigma_obs ~ normal(0, sigma_sd);          // half-normal
 
-  // ---- What the data say ---------------------------------------------------
+  // ---- Likelihood ---------------------------------------------------------
   z     ~ bernoulli_logit(beta * (mu - logC50));   // every replicate
   y_obs ~ normal(mu[y_row], sigma_obs);            // those that detected something
 }

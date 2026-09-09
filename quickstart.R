@@ -91,9 +91,15 @@ plot_ages(ages)
 # Three things to get right:
 #
 #   * one row per PCR replicate, non-detections included
-#   * logC on a single volumetric scale. Everything here is log copies per
-#     litre of water, so divide by the volume you filtered before you take the
-#     log. If your instrument reports copies per mL, multiply by 1000 first.
+#   * logC expressed per unit volume of WATER SAMPLED. The model imposes no
+#     particular unit, since p is a difference of logarithms and r has units of
+#     inverse time; whatever unit is supplied is the unit C is reported in, so
+#     long as the priors on C and on the detection threshold use the same scale.
+#     What matters is dividing by the volume of water filtered, which usually
+#     differs between samples. That correction is common to all markers within
+#     a sample and so does not bias its age, but it is needed to compare
+#     samples, to pool water samples into one unit, and to interpret the
+#     detection threshold.
 #   * r and p from the same markers you measured, on the same scale. p[1] must
 #     be exactly 0, since every offset is relative to the first marker.
 #

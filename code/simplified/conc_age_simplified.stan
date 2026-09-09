@@ -1,16 +1,16 @@
 // =============================================================================
 // conc_age_simplified.stan
 //
-// HOW OLD IS THIS eDNA? Estimating time since shedding from concentration
-// measurements. Works with qPCR or digital PCR.
+// Time since shedding, estimated from replicate concentration measurements.
+// Applicable to quantitative PCR and digital PCR.
 // -----------------------------------------------------------------------------
 //
-// START HERE IF YOU ARE NEW TO THE METHOD. This is the general-purpose version.
-// It reads whatever your instrument reports on a copies-per-volume scale,
-// together with a yes/no detection flag for each replicate. It never sees
-// droplets, so nothing about it is specific to ddPCR.
+// This is the general form of the observation model. It reads whatever the
+// instrument reports on a concentration scale, together with a detection
+// indicator for each replicate. It does not use droplet counts, so it is not
+// specific to droplet digital PCR.
 //
-// THE IDEA IN ONE PARAGRAPH
+// BACKGROUND
 //
 //   eDNA starts breaking down the moment it is released. If you measure several
 //   genetic markers from the same organism, and those markers break down at
@@ -45,7 +45,7 @@
 //   r and p come from a decay experiment, fitted by decay_simplified.stan, and
 //   are treated as known here.
 //
-// WHAT THE MODEL DOES WITH YOUR MEASUREMENTS
+// OBSERVATION MODEL
 //
 //   Two things vary between replicates, and they are kept separate:
 //
@@ -64,7 +64,7 @@
 //       z[i,j,r,s] ~ Bernoulli(logit^-1(beta * (log C[i,j,s] - logC50)))
 //       y[i,j,r,s] ~ Normal(log C[i,j,s], sigma_tech)          where z = 1
 //
-//   KEEP YOUR NON-DETECTIONS. A replicate that amplified nothing is not
+//   Non-detections must be retained. A replicate that did not amplify is not
 //   missing data. It says the concentration was below what your assay can see,
 //   which is exactly what a marker that has been decaying a long time looks
 //   like. Every replicate contributes a detection term whether or not it
@@ -84,14 +84,14 @@
 //   describe the same curve. Priors for logC50 and beta are set in R, so this
 //   one file serves a well-characterised assay and a poorly-characterised one.
 //
-// WHY THE TWO STANDARD DEVIATIONS ARE SHARED BETWEEN MARKERS
+// SHARED VARIANCE COMPONENTS
 //
 //   sigma_bio and sigma_tech are single numbers applied to every marker rather
 //   than one per marker. A marker-specific spread would shift each marker's
 //   estimated concentration by a different amount, which tilts the marker
 //   pattern -- and the marker pattern is exactly what carries the age.
 //
-// THERE IS NO MEAN CORRECTION IN THIS FILE
+// ABSENCE OF A LOGNORMAL MEAN CORRECTION
 //
 //   The ddPCR version of this model needs a -sigma^2/2 term because its
 //   likelihood applies an exponential to a quantity carrying log-scale noise.
@@ -99,7 +99,7 @@
 //   so no correction is needed and both standard deviations can be read
 //   straight off.
 //
-// USING THIS FILE WITHOUT BIOLOGICAL REPLICATION
+// DESIGNS WITHOUT BIOLOGICAL REPLICATION
 //
 //   Set use_bio = 0 when each unit is a single water sample. The biological
 //   level then disappears completely and only sigma_tech is estimated. N_bio
@@ -108,32 +108,32 @@
 
 
 data {
-  // ---- What is being aged --------------------------------------------------
+  // ---- Dimensions ---------------------------------------------------------
   int<lower=1> Nt;                       // number of units to date
   int<lower=1> Nloci;                    // number of markers
 
-  // ---- Known from the decay experiment -------------------------------------
+  // ---- Fixed from the decay experiment ------------------------------------
   vector[Nloci] r;                       // decay rate per marker, per hour, negative
   vector[Nloci] p;                       // starting level per marker, relative to
                                          //   marker 1, on the log scale; p[1] = 0
 
-  // ---- Every replicate, detected or not ------------------------------------
+  // ---- Observations: one row per PCR replicate ----------------------------
   int<lower=0> N;                                   // number of PCR replicates
   array[N] int<lower=1, upper=Nt>    obs_i;         // which unit this replicate belongs to
   array[N] int<lower=1, upper=Nloci> obs_j;         // which marker it measured
   array[N] int<lower=0, upper=1>     z;             // 1 if it amplified, 0 if not
 
-  // ---- The subset that produced a number -----------------------------------
+  // ---- Detected replicates only -------------------------------------------
   int<lower=0> N_y;                      // how many replicates detected something
   array[N_y] int<lower=1> y_row;         // their position in the list above
   vector[N_y] y_obs;                     // their measurements, log copies per litre
 
-  // ---- Grouping of replicates into water samples ---------------------------
+  // ---- Replicate structure ------------------------------------------------
   int<lower=0, upper=1> use_bio;         // 1 = model between-sample variation
   int<lower=1> N_bio;                    // number of water samples
   array[N] int<lower=1> bio_idx;         // which water sample each replicate came from
 
-  // ---- Prior settings, chosen in R -----------------------------------------
+  // ---- Prior hyperparameters ----------------------------------------------
   real C0_mean;                          // expected log concentration when shed
   real<lower=0> C0_sd;                   // how uncertain that expectation is
   real<lower=0> t_mean;                  // expected age in hours
@@ -157,15 +157,15 @@ transformed data {
 
 
 parameters {
-  // ---- The quantities of interest ------------------------------------------
+  // ---- Parameters of interest ---------------------------------------------
   vector<lower=0>[Nt] t;                 // age of each unit, hours, cannot be negative
   vector<lower=0>[Nt] C;                 // log concentration of each unit when shed
 
-  // ---- The detection curve -------------------------------------------------
+  // ---- Detection function -------------------------------------------------
   real logC50;                           // log concentration at 50% detection
   real<lower=0> beta;                    // steepness of the curve there
 
-  // ---- How much things vary ------------------------------------------------
+  // ---- Variance components ------------------------------------------------
   real<lower=0> sigma_tech;              // SD between replicates of one water sample
   vector<lower=0>[use_bio ? 1 : 0] sigma_bio;
                                          // SD between water samples of one unit.
@@ -173,7 +173,7 @@ parameters {
                                          //   when switched off) so it can be removed
                                          //   cleanly; sb below unwraps it.
 
-  // ---- The individual departures -------------------------------------------
+  // ---- Standardised random effects ----------------------------------------
   // Held in standard units, mean 0 and SD 1, and multiplied by sigma_bio below.
   // Written this way rather than drawn directly at scale sigma_bio, which gives
   // the sampler an evenly shaped space to explore.
@@ -207,9 +207,9 @@ transformed parameters {
 
 
 model {
-  // ---- What we believe before seeing the data ------------------------------
+  // ---- Priors -------------------------------------------------------------
   t ~ normal(t_mean, t_sd);              // truncated at 0 by the declaration above
-  C ~ normal(C0_mean, C0_sd);            // likewise
+  C ~ normal(C0_mean, C0_sd);            // half-normal
 
   logC50 ~ normal(logC50_mean, logC50_sd);
   beta   ~ normal(beta_mean, beta_sd);   // half-normal: beta cannot be negative
@@ -223,7 +223,7 @@ model {
   to_vector(eta_raw) ~ std_normal();     // to_vector flattens the matrix so the
                                          //   same prior applies to every entry
 
-  // ---- What the data say ---------------------------------------------------
+  // ---- Likelihood ---------------------------------------------------------
   z     ~ bernoulli_logit(beta * (level - logC50));   // every replicate
   y_obs ~ normal(level[y_row], sigma_tech);           // those that detected something
 }

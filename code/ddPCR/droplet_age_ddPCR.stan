@@ -1,11 +1,11 @@
 // =============================================================================
 // droplet_age_ddPCR.stan
 //
-// HOW OLD IS THIS eDNA? Estimating time since shedding from ddPCR droplet
-// counts.
+// Time since shedding, estimated from ddPCR droplet counts.
+//
 // -----------------------------------------------------------------------------
 //
-// THE IDEA IN ONE PARAGRAPH
+// BACKGROUND
 //
 //   eDNA starts breaking down the moment it is released. If you measure several
 //   genetic markers from the same organism, and those markers break down at
@@ -42,7 +42,7 @@
 //   r and p come from a separate decay experiment, fitted by
 //   decay_monophasic_ddPCR.stan, and are treated as known here.
 //
-// FROM CONCENTRATION TO WHAT THE MACHINE REPORTS
+// OBSERVATION MODEL
 //
 //   Droplet digital PCR splits one reaction into roughly twenty thousand
 //   droplets and reports how many of them contained the target. So the data
@@ -79,7 +79,7 @@
 //   zero says the concentration was low, which is what an old marker looks
 //   like. Discarding them would bias ages young.
 //
-// WHY THE TWO STANDARD DEVIATIONS ARE SHARED BETWEEN MARKERS
+// SHARED VARIANCE COMPONENTS
 //
 //   Both sigma_bio and sigma_tech are single numbers applied to every marker,
 //   rather than one per marker. The reason is that noise on a log scale
@@ -91,7 +91,7 @@
 //   constant, absorbed harmlessly by C[i], so measurement noise widens the age
 //   estimate without moving it.
 //
-// WHY THE TWO LEVELS ARE SEPARATED
+// NESTED REPLICATE STRUCTURE
 //
 //   Wells from one water sample are not independent observations of the unit.
 //   Whatever makes one bottle differ from another is shared by all of its
@@ -99,7 +99,7 @@
 //   the levels separate stops technical replication from buying precision it
 //   has not earned, and lets each source of variation be reported on its own.
 //
-// USING THIS FILE WITHOUT BIOLOGICAL REPLICATION
+// DESIGNS WITHOUT BIOLOGICAL REPLICATION
 //
 //   Set use_bio = 0 when each unit is a single water sample, as in the carboy
 //   experiment. The biological level then disappears completely and only
@@ -108,16 +108,16 @@
 
 
 data {
-  // ---- What is being aged --------------------------------------------------
+  // ---- Dimensions ---------------------------------------------------------
   int<lower=1> Nt;                       // number of units to date
   int<lower=1> Nloci;                    // number of markers
 
-  // ---- Known from the decay experiment -------------------------------------
+  // ---- Fixed from the decay experiment ------------------------------------
   vector[Nloci] r;                       // decay rate per marker, per hour, negative
   vector[Nloci] p;                       // starting level per marker, relative to
                                          //   marker 1, on the log scale; p[1] = 0
 
-  // ---- The observations, one row per PCR well ------------------------------
+  // ---- Observations: one row per ddPCR well -------------------------------
   int<lower=0> N;                                   // number of wells
   array[N] int<lower=1, upper=Nt>    obs_i;         // which unit this well belongs to
   array[N] int<lower=1, upper=Nloci> obs_j;         // which marker this well measured
@@ -125,12 +125,12 @@ data {
   array[N] int<lower=1> U;                          // droplets the reader accepted
   vector[N] log_offset;                             // volumetric conversion, see header
 
-  // ---- Grouping of wells into water samples --------------------------------
+  // ---- Replicate structure ------------------------------------------------
   int<lower=0, upper=1> use_bio;         // 1 = model between-sample variation
   int<lower=1> N_bio;                    // number of water samples
   array[N] int<lower=1> bio_idx;         // which water sample each well came from
 
-  // ---- Prior settings, chosen in R -----------------------------------------
+  // ---- Prior hyperparameters ----------------------------------------------
   real C0_mean;                          // expected log concentration when shed
   real<lower=0> C0_sd;                   // how uncertain that expectation is
   real<lower=0> t_mean;                  // expected age in hours
@@ -150,11 +150,11 @@ transformed data {
 
 
 parameters {
-  // ---- The quantities of interest ------------------------------------------
+  // ---- Parameters of interest ---------------------------------------------
   vector<lower=0>[Nt] t;                 // age of each unit, hours, cannot be negative
   vector<lower=0>[Nt] C;                 // log concentration of each unit when shed
 
-  // ---- How much things vary ------------------------------------------------
+  // ---- Variance components ------------------------------------------------
   real<lower=0> sigma_tech;              // SD between wells of one water sample
   vector<lower=0>[use_bio ? 1 : 0] sigma_bio;
                                          // SD between water samples of one unit.
@@ -162,7 +162,7 @@ parameters {
                                          //   when switched off) so that it can be
                                          //   removed cleanly; sb below unwraps it.
 
-  // ---- The individual departures -------------------------------------------
+  // ---- Standardised random effects ----------------------------------------
   // These are held in standard units, mean 0 and SD 1, and are multiplied by
   // the standard deviations above to give the actual departures. Writing them
   // this way rather than drawing them directly at scale sigma leaves the
@@ -207,9 +207,9 @@ transformed parameters {
 
 
 model {
-  // ---- What we believe before seeing the data ------------------------------
+  // ---- Priors -------------------------------------------------------------
   t ~ normal(t_mean, t_sd);              // truncated at 0 by the declaration above
-  C ~ normal(C0_mean, C0_sd);            // likewise
+  C ~ normal(C0_mean, C0_sd);            // half-normal
 
   // Variation between wells of one water sample.
   sigma_tech ~ normal(0, sigma_sd);      // half-normal: sigma_tech cannot be negative
@@ -221,7 +221,7 @@ model {
   to_vector(eta_raw) ~ std_normal();     // to_vector flattens the matrix so the
                                          //   same prior applies to every entry
 
-  // ---- What the data say ---------------------------------------------------
+  // ---- Likelihood ---------------------------------------------------------
   W ~ binomial(U, inv_cloglog(omega));
 }
 
