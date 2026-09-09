@@ -1,6 +1,5 @@
 # Quantitative aging of environmental DNA
 
-=======
 Code and data accompanying the manuscript *[Quantitative Aging of Environmental DNA Using Multiple Fragment Sizes]*.
 
 This repository reproduces the figures and parameter estimates in the manuscript
@@ -46,7 +45,7 @@ widens the age posterior without displacing it.
 ## Two observation models
 
 The process equation and the error structure are identical in both. They differ
-in what format the tata is input.
+in what format the data are supplied.
 
 **`code/ddPCR/`** — droplet model, used in the manuscript. Takes the number of
 positive droplets out of the number accepted, per well, and models them as
