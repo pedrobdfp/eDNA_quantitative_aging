@@ -1,158 +1,165 @@
 // =============================================================================
 // decay_monophasic_ddPCR.stan
+//
+// Marker-specific first-order decay rates, estimated from a controlled
+// experiment using ddPCR droplet counts.
 // -----------------------------------------------------------------------------
-// Marker-specific first-order decay rates estimated from the carboy
-// experiment, using the same observation model as droplet_age_ddPCR.stan so
-// that the rates are estimated under the likelihood they are later used with.
 //
-// PROCESS
-//     log C_ikt = C_0[i,k] - lambda[k] * t
+// PURPOSE
 //
-//   for carboy i, marker k and elapsed time t. Each carboy and marker has its
-//   own starting concentration C_0, and lambda[k] is the decay rate of marker
-//   k, constrained positive and subtracted so that concentration declines.
+//   The age model (droplet_age_ddPCR.stan) needs to know two things about each
+//   marker before it can date anything: how quickly the marker disappears, and
+//   where it starts relative to the others. This file measures both, from an
+//   experiment in which seawater was held in sealed carboys and subsampled
+//   repeatedly over time.
 //
-// OBSERVATION
-//     log C_obs = log C_ikt + eps - sigma_obs^2 / 2
-//                 eps ~ Normal(0, sigma_obs)
-//     omega     = log C_obs - log(20) + log(1.818) + log(Dilution)
-//                 - log(50 / Filtered) - 7.07
-//     W ~ Binomial(U, 1 - exp(-exp(omega)))
+//   Here the elapsed time is known and the decay rate is estimated. In the age
+//   model it is the other way round: the rate is known and the time is
+//   estimated. The same observation model is used in both, so the rates are
+//   measured under the same likelihood that later consumes them.
 //
-//   The offset terms convert a seawater concentration into expected copies per
-//   droplet given the reaction, elution, dilution and filtered volumes; they
-//   are algebraically identical to the offset used for the field samples.
-//   sigma_obs is the replicate-level SD of log concentration, shared across
-//   markers so that the mean correction is constant and cannot displace lambda.
+// THE PROCESS MODEL
+//
+//   Each carboy-and-marker combination is called a series and has its own
+//   starting level. Within a series, concentration falls exponentially, which
+//   on the log scale is a straight line:
+//
+//       log C[n] = C0[series[n]] - lambda[marker[n]] * time[n]
+//
+//   in log copies per litre, where
+//
+//       C0      the log concentration at the start of the experiment, one per
+//               series, estimated as the intercept of that line
+//       lambda  the decay rate of a marker, per hour, estimated. It is held
+//               positive and subtracted, so a larger lambda means faster loss.
+//       time    hours since the carboys were filled, known
+//
+//   The samples taken at the start are ordinary observations with time = 0.
+//   They inform C0 through the same likelihood as every other observation and
+//   are given no special treatment, so C0 really is just the intercept of the
+//   fitted line.
+//
+// OBSERVATION MODEL
+//
+//       omega[n] = log C[n] + log_offset[n] + sigma_obs * eps[n] - sigma_obs^2/2
+//       W[n] ~ Binomial(U[n], 1 - exp(-exp(omega[n])))
+//
+//   W is the number of droplets that came up positive out of U accepted. The
+//   expression 1 - exp(-exp(omega)), written inv_cloglog in Stan, is the chance
+//   that any one droplet holds at least one copy.
+//
+//   log_offset converts copies per litre of seawater into expected copies per
+//   droplet, given how much water was filtered, any dilution, the elution
+//   volume and the size of a droplet. It is computed in R by the same function
+//   the field analysis uses, so both parts of the study share one definition.
+//
+//   sigma_obs is the spread between PCR wells measuring the same sample. The
+//   final term corrects for the fact that exponentiating symmetric noise on a
+//   log scale would otherwise inflate the average; because sigma_obs is shared
+//   across markers this correction is one constant and cannot bend the decay
+//   rates.
+//
+// QUANTITIES PASSED TO THE AGE MODEL
+//
+//   r      the decay rates written as negative numbers, which is the sign
+//          convention the age model expects
+//   p_log  each marker's starting level relative to the first marker, taken
+//          from the fitted intercepts. This is the right quantity to pass on,
+//          because the age model assumes a straight line of slope r, so the
+//          offset it needs is the intercept of that same line.
 // =============================================================================
 
+
 data {
-  int N_obs_0;
-  int N_obs_1;
-  int N_ijk_1;
-  int N_ik_0;
-  int N_k_1;
+  // ---- Dimensions ---------------------------------------------------------
+  int<lower=1> N;                        // number of PCR wells
+  int<lower=1> N_series;                 // carboy x marker combinations
+  int<lower=1> N_marker;                 // number of markers
 
-  array[N_obs_0] int ik_idx_0;
-  array[N_obs_1] int ijk_idx_1;
-  array[N_ijk_1] int s_ik_idx_1;
-  array[N_ijk_1] int s_k_idx_1;
-  array[N_ik_0] int ik_to_k;
+  // ---- Observations: one row per ddPCR well -------------------------------
+  array[N] int<lower=1, upper=N_series> series;   // which series this well belongs to
+  array[N] int<lower=1, upper=N_marker> marker;   // which marker it measured
+  vector<lower=0>[N] time;                        // hours since the carboys were filled
+  vector[N] log_offset;                           // volumetric conversion, see header
+  array[N] int<lower=0> W;                        // droplets that were positive
+  array[N] int<lower=1> U;                        // droplets the reader accepted
 
-  array[N_ijk_1] real time;
-  array[N_obs_0] real Dilution_0;
-  array[N_obs_1] real Dilution_1;
-  array[N_obs_0] real Filtered_0;
-  array[N_obs_1] real Filtered_1;
-  array[N_obs_0] int U_0;
-  array[N_obs_1] int U_1;
-  array[N_obs_0] int W_0;
-  array[N_obs_1] int W_1;
+  // ---- Marker of each series, used for the per-marker summaries -----------
+  array[N_series] int<lower=1, upper=N_marker> series_marker;
 
-  int N_time_sim;
-  array[N_time_sim] real time_sim;
-
-  real<lower=0> sigma_obs_sd;      // half-normal prior scale
+  // ---- Prior hyperparameters ----------------------------------------------
+  real<lower=0> sigma_obs_sd;            // scale of the prior on well-to-well spread
+  real<lower=0> lambda_sd;               // scale of the prior on the decay rates
+  real C0_mean;                          // expected starting log concentration
+  real<lower=0> C0_sd;                   // how uncertain that expectation is
 }
 
-transformed data {
-  // marker index of every observation, from the existing index maps
-  array[N_obs_0] int k_of_0;
-  array[N_obs_1] int k_of_1;
-
-  for (i in 1:N_obs_0) k_of_0[i] = ik_to_k[ik_idx_0[i]];
-  for (i in 1:N_obs_1) k_of_1[i] = s_k_idx_1[ijk_idx_1[i]];
-}
 
 parameters {
-  vector[N_ik_0]         C_0;        // log-concentration at t=0, per carboy x locus
-  vector<lower=0>[N_k_1] lambda;     // monophasic decay, per locus (positive)
-  real<lower=0> sigma_obs;           // observation noise, shared across markers
-  vector[N_obs_0] eps0_raw;
-  vector[N_obs_1] eps1_raw;
+  vector[N_series] C0;                   // starting log concentration of each series
+  vector<lower=0>[N_marker] lambda;      // decay rate of each marker, per hour
+  real<lower=0> sigma_obs;               // spread between wells of one sample
+
+  // Departures of individual wells, held in standard units and multiplied by
+  // sigma_obs below. Written this way rather than drawn directly at scale
+  // sigma_obs, which gives the sampler an evenly shaped space to explore.
+  vector[N] eps_raw;
 }
+
 
 transformed parameters {
-  vector[N_ijk_1] C;
-  vector[N_obs_0] omega_0;
-  vector[N_obs_1] omega_1;
+  vector[N] omega;                       // log expected copies per droplet, per well
 
-  // decay curve
-  for (j in 1:N_ijk_1) {
-    C[j] = C_0[s_ik_idx_1[j]] - lambda[s_k_idx_1[j]] * time[j];
-  }
+  {
+    // Cancels the inflation that exponentiating log-scale noise would cause,
+    // so C0 keeps its plain meaning. One constant, shared by every marker.
+    real correction = 0.5 * square(sigma_obs);
 
-  // t = 0 droplets
-  for (i in 1:N_obs_0) {
-    real s = sigma_obs;
-    omega_0[i] =
-        C_0[ik_idx_0[i]]
-      - log(20)
-      + log(1.818)
-      + log(Dilution_0[i])
-      - log(50 / Filtered_0[i])
-      - 7.07
-      + s * eps0_raw[i] - 0.5 * square(s);
-  }
-
-  // droplets, t > 0
-  for (i in 1:N_obs_1) {
-    real s = sigma_obs;
-    omega_1[i] =
-        C[ijk_idx_1[i]]
-      - log(20)
-      + log(1.818)
-      + log(Dilution_1[i])
-      - log(50 / Filtered_1[i])
-      - 7.07
-      + s * eps1_raw[i] - 0.5 * square(s);
-  }
-}
-
-model {
-  W_0 ~ binomial(U_0, inv_cloglog(omega_0));
-  W_1 ~ binomial(U_1, inv_cloglog(omega_1));
-
-  C_0       ~ normal(0, 4);
-  lambda    ~ normal(0, 1);
-  sigma_obs ~ normal(0, sigma_obs_sd);
-  eps0_raw  ~ std_normal();
-  eps1_raw  ~ std_normal();
-}
-
-generated quantities {
-  matrix[N_time_sim, N_k_1] C_sim;
-  array[N_obs_0] int W_pred_0;
-  array[N_obs_1] int W_pred_1;
-  vector[N_k_1] half_life;
-
-  for (k in 1:N_k_1) half_life[k] = log(2) / lambda[k];
-
-  for (i in 1:N_obs_0) {
-    W_pred_0[i] = binomial_rng(U_0[i], inv_cloglog(omega_0[i]));
-  }
-  for (i in 1:N_obs_1) {
-    W_pred_1[i] = binomial_rng(U_1[i], inv_cloglog(omega_1[i]));
-  }
-
-  // mean decay curve per marker
-  for (t in 1:N_time_sim) {
-    for (k in 1:N_k_1) {
-      real sum_c0 = 0;
-      int n_c0 = 0;
-      for (ik in 1:N_ik_0) {
-        if (ik_to_k[ik] == k) {
-          sum_c0 += C_0[ik];
-          n_c0 += 1;
-        }
-      }
-      if (n_c0 == 0) {
-        C_sim[t, k] = negative_infinity();
-      } else {
-        real C0_bar = sum_c0 / n_c0;
-        C_sim[t, k] = C0_bar - lambda[k] * time_sim[t];
-      }
+    for (n in 1:N) {
+      omega[n] = C0[series[n]] - lambda[marker[n]] * time[n]   // the decay line
+                 + log_offset[n]                               // to copies per droplet
+                 + sigma_obs * eps_raw[n]                      // this well's departure
+                 - correction;
     }
   }
 }
 
+
+model {
+  // ---- Priors -------------------------------------------------------------
+  C0        ~ normal(C0_mean, C0_sd);
+  lambda    ~ normal(0, lambda_sd);      // half-normal: lambda cannot be negative
+  sigma_obs ~ normal(0, sigma_obs_sd);   // half-normal
+  eps_raw   ~ std_normal();
+
+  // ---- Likelihood ---------------------------------------------------------
+  W ~ binomial(U, inv_cloglog(omega));
+}
+
+
+generated quantities {
+  vector[N_marker] r = -lambda;          // decay rates in the age model's convention
+  vector[N_marker] half_life;            // hours for a marker to halve
+  vector[N_marker] C0_bar;               // average starting level of each marker
+  vector[N_marker] p_log;                // starting level relative to marker 1
+  vector[N] log_lik;                     // fit of each well, for model comparison
+
+  for (k in 1:N_marker) {
+    half_life[k] = log(2) / lambda[k];
+
+    // Average the intercepts of every series belonging to this marker, that is,
+    // across carboys.
+    real total = 0;
+    int  n_k   = 0;
+    for (s in 1:N_series) {
+      if (series_marker[s] == k) { total += C0[s]; n_k += 1; }
+    }
+    C0_bar[k] = n_k == 0 ? negative_infinity() : total / n_k;
+  }
+
+  // Offsets are relative, so the first marker is the reference and is zero by
+  // construction.
+  for (k in 1:N_marker) p_log[k] = C0_bar[k] - C0_bar[1];
+
+  for (n in 1:N) log_lik[n] = binomial_lpmf(W[n] | U[n], inv_cloglog(omega[n]));
+}

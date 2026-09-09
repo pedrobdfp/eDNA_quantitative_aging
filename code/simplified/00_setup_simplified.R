@@ -40,10 +40,22 @@ data_path <- function(fname) {
 }
 
 # --- Concentration scale -----------------------------------------------------
-# Every concentration in this analysis is copies per LITRE of water, and every
-# model quantity is its natural log. Choosing one volumetric scale and staying
-# on it is the only convention the simplified model imposes; if your data are
-# copies per mL, multiply by 1000 before you start.
+# The model does not impose a unit. p[j] is a difference of logarithms and r[j]
+# has units of inverse time, so neither carries a concentration scale: whatever
+# unit the data are supplied in is the unit in which C[i] is reported. The
+# requirement is only that the data, the prior on C and the prior on the
+# detection threshold all use the same scale.
+#
+# What the unit must refer to is a fixed volume of WATER SAMPLED, not a volume
+# of reaction or of extract. Concentrations are therefore converted from the
+# instrument reading using the dilution, the template and elution volumes, and
+# the volume of water filtered, which varies between samples. Within one sample
+# that conversion is common to all markers and is absorbed by C[i], so it does
+# not bias that sample's age; it matters when samples that filtered different
+# volumes are compared, when water samples are pooled into one unit, and when
+# the detection threshold is interpreted.
+#
+# This analysis works in copies per litre of seawater.
 
 CONC_UNITS <- "copies per litre of water"
 
