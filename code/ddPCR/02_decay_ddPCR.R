@@ -49,67 +49,54 @@ locus_to_marker <- c(
 # Helpers
 # =============================================================================
 
-make_index <- function(df, col, new_col) {
-  vals <- sort(unique(df[[col]]))
-  df[[new_col]] <- match(df[[col]], vals)
-  df
-}
 
-combine_index <- function(df, cols, new_col) {
-  key <- df %>%
-    transmute(.key = do.call(paste, c(across(all_of(cols)), sep = "||")))
-  lev <- unique(key$.key)
-  map <- tibble(.key = lev, !!as.name(new_col) := seq_along(lev))
-  df %>% bind_cols(key) %>% left_join(map, by = ".key") %>% select(-.key)
-}
-
-# Data list consumed by decay_monophasic_ddPCR.stan
+# Data list consumed by decay_monophasic_ddPCR.stan.
+#
+# One row per well. The t = 0 samples are included as ordinary observations
+# with time = 0, so C0 is simply the intercept of the log-linear decay and the
+# t = 0 wells inform it through the same likelihood as every other well.
+#
+# A "series" is one carboy x marker combination and has its own C0. The only
+# other index a well needs is which marker it is, for lambda. The volumetric
+# offset is computed here with droplet_log_offset(), the same function the
+# field analysis uses.
 build_decay_data <- function(dat, locus_levels_ord) {
-  dat <- dat %>%
+  d <- dat %>%
     mutate(
-      locus          = factor(paste(Component, Marker, sep = "_"),
-                              levels = locus_levels_ord),
-      k_idx          = as.integer(locus),
-      Hours_base     = as.numeric(Hours_base),
-      Total_droplets = Positive_droplets + Negative_droplets
+      locus      = factor(paste(Component, Marker, sep = "_"),
+                          levels = locus_levels_ord),
+      marker     = as.integer(locus),
+      time       = as.numeric(Hours_base),
+      W          = as.integer(Positive_droplets),
+      U          = as.integer(Positive_droplets + Negative_droplets),
+      log_offset = droplet_log_offset(vol_L    = as.numeric(Filt_mL) / 1000,
+                                      dilution = as.numeric(Dilution)),
+      series_key = paste(Carboy, marker, sep = "|")
     ) %>%
-    filter(!is.na(k_idx), !is.na(Negative_droplets)) %>%
-    make_index("Carboy",    "i_idx") %>%
-    make_index("Timepoint", "j_idx") %>%
-    combine_index(c("k_idx", "i_idx"), "ik_idx")
+    filter(!is.na(marker), !is.na(U), U > 0, !is.na(time), !is.na(log_offset)) %>%
+    arrange(series_key, time)
 
-  df0 <- dat %>% filter(Hours_base == 0)
-  df1 <- dat %>%
-    filter(Hours_base > 0) %>%
-    combine_index(c("k_idx", "i_idx", "j_idx"), "ijk_idx") %>%
-    arrange(ijk_idx)
+  series_levels <- unique(d$series_key)
+  d$series      <- match(d$series_key, series_levels)
 
-  secondary_idx <- df1 %>% distinct(ijk_idx, k_idx, ik_idx, Hours_base)
-  ik_map        <- dat %>% distinct(ik_idx, k_idx) %>% arrange(ik_idx)
+  series_marker <- d %>% distinct(series, marker) %>% arrange(series) %>%
+    pull(marker)
 
   list(
-    N_obs_0    = nrow(df0),
-    N_obs_1    = nrow(df1),
-    N_ijk_1    = n_distinct(df1$ijk_idx),
-    N_ik_0     = n_distinct(df0$ik_idx),
-    N_k_1      = n_distinct(df1$k_idx),
-    ik_idx_0   = as.integer(df0$ik_idx),
-    ijk_idx_1  = as.integer(df1$ijk_idx),
-    s_ik_idx_1 = as.integer(secondary_idx$ik_idx),
-    s_k_idx_1  = as.integer(secondary_idx$k_idx),
-    ik_to_k    = as.integer(ik_map$k_idx),
-    time       = as.numeric(secondary_idx$Hours_base),
-    Dilution_0 = as.numeric(df0$Dilution),
-    Dilution_1 = as.numeric(df1$Dilution),
-    Filtered_0 = as.numeric(df0$Filt_mL) / 1000,
-    Filtered_1 = as.numeric(df1$Filt_mL) / 1000,
-    W_0        = as.integer(df0$Positive_droplets),
-    W_1        = as.integer(df1$Positive_droplets),
-    U_0        = as.integer(df0$Total_droplets),
-    U_1        = as.integer(df1$Total_droplets),
-    N_time_sim = length(unique(df1$Hours_base)),
-    time_sim   = sort(unique(as.numeric(df1$Hours_base))),
-    sigma_obs_sd = SIGMA_SD
+    N             = nrow(d),
+    N_series      = length(series_levels),
+    N_marker      = length(locus_levels_ord),
+    series        = as.integer(d$series),
+    marker        = as.integer(d$marker),
+    time          = as.numeric(d$time),
+    log_offset    = as.numeric(d$log_offset),
+    W             = as.integer(d$W),
+    U             = as.integer(d$U),
+    series_marker = as.integer(series_marker),
+    sigma_obs_sd  = SIGMA_SD,
+    lambda_sd     = 1,
+    C0_mean       = 0,
+    C0_sd         = 4
   )
 }
 
@@ -183,8 +170,8 @@ decay_sd_all <- build_decay_data(dat_all, locus_levels_master)
 fit_decay_all <- stan(
   file    = stan_decay,
   data    = decay_sd_all,
-  init    = function() list(C_0    = rep(10,   decay_sd_all$N_ik_0),
-                            lambda = rep(0.01, decay_sd_all$N_k_1)),
+  init    = function() list(C0     = rep(10,   decay_sd_all$N_series),
+                            lambda = rep(0.15, decay_sd_all$N_marker)),
   chains  = 4, iter = 3000, warmup = 1000, seed = 99,
   control = list(adapt_delta = 0.95), refresh = 300
 )
@@ -206,14 +193,31 @@ message("\nDecay rates:")
 print(round(as.data.frame(lambda_summ[, c("mean", "sd", "2.5%", "97.5%",
                                           "n_eff", "Rhat")]), 4))
 
+# Marker offsets come from the decay model's own posterior (p_log in generated
+# quantities), so they are estimated from the droplet counts under the same
+# likelihood as everything else, use the t = 0 non-detections, and carry the
+# lognormal mean correction. The alternative -- a mean of logged concentrations
+# computed outside the model -- ignores all three.
+p_summ       <- summary(fit_decay_all, pars = "p_log",
+                        probs = c(0.025, 0.5, 0.975))$summary
+p_raw        <- as.numeric(p_summ[, "mean"])
+names(p_raw) <- locus_levels_master
+
+message("\nMarker offsets p from the posterior (log copies/L, relative to ",
+        locus_levels_master[1], "):")
+print(round(p_summ[, c("mean", "sd", "2.5%", "97.5%", "n_eff", "Rhat")], 4))
+
+# The raw t = 0 summary is still used for the prior on baseline concentration
+# in the leave-one-out age fits: there the relevant scale is the spread between
+# carboys, not the posterior uncertainty in a mean.
 pc_all <- compute_p_and_C0_L(dat_all %>% filter(Hours_base == 0),
                              locus_levels_master)
-p_raw        <- pc_all$p
-names(p_raw) <- locus_levels_master
 
 message("\nt = 0 summary per locus (log copies/L):")
 print(as.data.frame(pc_all$table))
 message("C0_mean (reference locus, log copies/L): ", round(pc_all$C0_mean, 4))
+message("p from raw t = 0 means, for comparison: ",
+        paste(round(pc_all$p, 4), collapse = ", "))
 
 r_by_marker_fit        <- r_raw[names(locus_to_marker)]
 names(r_by_marker_fit) <- locus_to_marker[names(locus_to_marker)]
@@ -262,12 +266,18 @@ for (f in folds) {
   fit_decay <- stan(
     file   = stan_decay,
     data   = decay_sd,
-    init   = function() list(C_0    = rep(10,   decay_sd$N_ik_0),
-                             lambda = rep(0.01, decay_sd$N_k_1)),
+    init   = function() list(C0     = rep(10,   decay_sd$N_series),
+                             lambda = rep(0.15, decay_sd$N_marker)),
     chains = 2, iter = 2500, warmup = 500, seed = 42 + f$test, refresh = 0
   )
 
+  # Rates and offsets both from this fold's posterior, so the held-out carboy
+  # is scored against a model fitted only to the other two.
   r_vec <- -as.numeric(summary(fit_decay, pars = "lambda")$summary[, "mean"])
+  p_vec <-  as.numeric(summary(fit_decay, pars = "p_log")$summary[, "mean"])
+
+  # Prior on baseline concentration still comes from the training carboys'
+  # observed t = 0 spread.
   pc    <- compute_p_and_C0_L(dat_train %>% filter(Hours_base == 0),
                               locus_levels_master)
 
@@ -286,7 +296,7 @@ for (f in folds) {
     Nt      = nrow(built$tp_map),
     Nloci   = length(locus_levels_master),
     r_vec   = r_vec,
-    p_vec   = pc$p,
+    p_vec   = p_vec,
     C0_mean = pc$C0_mean,
     C0_sd   = pc$C0_sd,
     t_mean  = t_mean_prior,

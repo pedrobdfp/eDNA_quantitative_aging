@@ -176,10 +176,23 @@ print(round(.obs[, c("mean", "sd", "2.5%", "97.5%", "n_eff", "Rhat")], 4))
 write.csv(data.frame(parameter = rownames(.obs), .obs, row.names = NULL),
           out_path("decay_observation_parameters.csv"), row.names = FALSE)
 
+# Marker offsets from the model's own posterior (p_log in generated
+# quantities), estimated under the same likelihood as the decay rates and
+# using the t = 0 non-detections, rather than from a mean of logged
+# concentrations computed outside the model.
+p_summ       <- summary(fit_decay_all, pars = "p_log",
+                        probs = c(0.025, 0.5, 0.975))$summary
+p_raw        <- as.numeric(p_summ[, "mean"])
+names(p_raw) <- locus_levels_master
+
+message("\nMarker offsets p from the posterior (relative to ",
+        locus_levels_master[1], "):")
+print(round(p_summ[, c("mean", "sd", "2.5%", "97.5%", "n_eff", "Rhat")], 4))
+
+# The raw t = 0 summary still supplies the prior on baseline concentration for
+# the leave-one-out age fits, where the between-carboy spread is what matters.
 pc_all <- compute_p_and_C0_L(dat_all %>% filter(Hours_base == 0),
                              locus_levels_master)
-p_raw        <- pc_all$p
-names(p_raw) <- locus_levels_master
 
 message("\nt = 0 summary per locus (log copies/L):")
 print(as.data.frame(pc_all$table))
@@ -237,7 +250,13 @@ for (f in folds) {
     chains = 2, iter = 2500, warmup = 500, seed = 42 + f$test, refresh = 0
   )
 
+  # Rates and offsets both from this fold's posterior, so the held-out carboy
+  # is scored against a model fitted only to the other two.
   r_vec <- -as.numeric(summary(fit_decay, pars = "lambda")$summary[, "mean"])
+  p_vec <-  as.numeric(summary(fit_decay, pars = "p_log")$summary[, "mean"])
+
+  # The prior on baseline concentration still comes from the training carboys'
+  # observed t = 0 spread.
   pc    <- compute_p_and_C0_L(dat_train %>% filter(Hours_base == 0),
                               locus_levels_master)
 
@@ -256,7 +275,7 @@ for (f in folds) {
     Nt      = nrow(built$tp_map),
     Nloci   = length(locus_levels_master),
     r_vec   = r_vec,
-    p_vec   = pc$p,
+    p_vec   = p_vec,
     C0_mean = pc$C0_mean,
     C0_sd   = pc$C0_sd,
     t_mean  = t_mean_prior,

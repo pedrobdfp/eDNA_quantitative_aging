@@ -1,102 +1,160 @@
 // =============================================================================
 // decay_simplified.stan
+//
+// HOW FAST DOES EACH MARKER DECAY? Estimating decay rates from a controlled
+// experiment, using concentration measurements. Works with qPCR or digital PCR.
 // -----------------------------------------------------------------------------
-// Marker-specific first-order decay rates from a controlled decay experiment,
-// using the same concentration observation model as conc_age_simplified.stan
-// so that the rates are estimated under the likelihood they are later used
-// with.
 //
-// PROCESS
-//     log C_ikt = C0[i,k] - lambda[k] * t                   (log copies / L)
+// WHAT THIS IS FOR
 //
-//   for vessel i, marker k and elapsed time t. Each vessel-marker pair has its
-//   own starting concentration; lambda[k] is constrained positive and
-//   subtracted, so concentration declines.
+//   The age model (conc_age_simplified.stan) needs to know two things about
+//   each marker before it can date anything: how quickly the marker
+//   disappears, and where it starts relative to the others. This file measures
+//   both, from an experiment in which water is held in a sealed vessel and
+//   subsampled over time.
 //
-// OBSERVATION
-//     z_n ~ Bernoulli(logit^-1(beta * (log C_n - logC50)))
-//     y_n ~ Normal(log C_n, sigma_obs)                      where z = 1
+//   Here the elapsed time is known and the decay rate is estimated. In the age
+//   model it is the other way round: the rate is known and the time is
+//   estimated. The same observation model is used in both, so the rates are
+//   measured under the same likelihood that later consumes them.
 //
-//   Inputs are concentrations, not droplet counts, so this file works for qPCR
-//   and ddPCR alike. A decay experiment usually has technical replication only
-//   -- one vessel sampled repeatedly, several PCR wells per sample -- so there
-//   is a single observation SD rather than the nested pair used in the field.
+//   To run this on your own system: fill a vessel with water containing your
+//   target, keep it under conditions resembling the field, and subsample it
+//   several times over a period long enough for a clear decline. Denser
+//   sampling early is worth more than a few distant points.
 //
-// OUTPUTS USED DOWNSTREAM
-//   r      the decay rates written negative, the convention the age model uses
-//   p_log  each marker's t = 0 log-concentration offset relative to marker 1,
-//          so p_log[1] is exactly 0
+// THE PROCESS MODEL
+//
+//   Each vessel-and-marker combination has its own starting level. Within one,
+//   concentration falls exponentially, which on the log scale is a straight
+//   line:
+//
+//       log C[n] = C0[ik[n]] - lambda[k[n]] * time[n]
+//
+//   in log copies per litre, where
+//
+//       C0      the log concentration at the start, one per vessel and marker,
+//               estimated as the intercept of that line
+//       lambda  the decay rate of a marker, per hour, estimated. It is held
+//               positive and subtracted, so a larger lambda means faster loss.
+//       time    hours since the start of the experiment, known
+//
+// WHAT THE MODEL DOES WITH YOUR MEASUREMENTS
+//
+//       z[n] ~ Bernoulli(logit^-1(beta * (log C[n] - logC50)))
+//       y[n] ~ Normal(log C[n], sigma_obs)                    where z = 1
+//
+//   Every replicate contributes a detection outcome; those that detected
+//   something contribute a measurement as well. Keep your non-detections: near
+//   the end of a decay experiment they are the observations that pin down how
+//   far the concentration has fallen.
+//
+//   sigma_obs is the spread between replicates measuring the same sample. A
+//   decay experiment usually has technical replication only -- one vessel
+//   sampled repeatedly, several PCR replicates per sample -- so a single
+//   observation spread is enough here, unlike the field model which separates
+//   variation between water samples from variation between replicates.
+//
+//   logC50 is the log concentration at which half of replicates amplify, the
+//   effective limit of detection, and beta is how sharply detection switches on
+//   there. The equivalent intercept of the more familiar alpha + beta * log C
+//   form is alpha = -beta * logC50 and is reported below.
+//
+// WHAT THIS FILE HANDS TO THE AGE MODEL
+//
+//   r      the decay rates written as negative numbers, which is the sign
+//          convention the age model expects
+//   p_log  each marker's starting level relative to the first marker, taken
+//          from the fitted intercepts. This is the right quantity to pass on,
+//          because the age model assumes a straight line of slope r, so the
+//          offset it needs is the intercept of that same line.
 // =============================================================================
 
+
 data {
-  int<lower=1> N;                                  // all replicate observations
-  int<lower=1> N_ik;                               // vessel x marker combinations
-  int<lower=1> N_k;                                // markers
+  // ---- Sizes ---------------------------------------------------------------
+  int<lower=1> N;                        // number of PCR replicates
+  int<lower=1> N_ik;                     // vessel x marker combinations
+  int<lower=1> N_k;                      // number of markers
 
-  array[N] int<lower=1, upper=N_ik> ik;
-  array[N] int<lower=1, upper=N_k>  k;
-  vector[N] time;                                  // hours since t = 0
-  array[N] int<lower=0, upper=1> z;                // 1 = detected
+  // ---- Every replicate, detected or not ------------------------------------
+  array[N] int<lower=1, upper=N_ik> ik;  // which vessel-and-marker this belongs to
+  array[N] int<lower=1, upper=N_k>  k;   // which marker it measured
+  vector[N] time;                        // hours since the start of the experiment
+  array[N] int<lower=0, upper=1> z;      // 1 if it amplified, 0 if not
 
-  int<lower=0> N_y;                                // detected observations
-  array[N_y] int<lower=1, upper=N> y_row;
-  vector[N_y] y_obs;                               // log copies / L
+  // ---- The subset that produced a number -----------------------------------
+  int<lower=0> N_y;                      // how many replicates detected something
+  array[N_y] int<lower=1, upper=N> y_row;   // their position in the list above
+  vector[N_y] y_obs;                        // their measurements, log copies per litre
 
+  // ---- Which marker each vessel-and-marker combination belongs to ----------
   array[N_ik] int<lower=1, upper=N_k> ik_to_k;
 
-  real C0_mean;
-  real<lower=0> C0_sd;
-  real logC50_mean;
-  real<lower=0> logC50_sd;
-  real beta_mean;
-  real<lower=0> beta_sd;
-  real<lower=0> sigma_sd;
-  real<lower=0> lambda_sd;
+  // ---- Prior settings, chosen in R -----------------------------------------
+  real C0_mean;                          // expected starting log concentration
+  real<lower=0> C0_sd;                   // how uncertain that expectation is
+  real logC50_mean;                      // expected limit of detection, log scale
+  real<lower=0> logC50_sd;               // how uncertain that expectation is
+  real beta_mean;                        // expected sharpness of the detection curve
+  real<lower=0> beta_sd;                 // how uncertain that expectation is
+  real<lower=0> sigma_sd;                // scale of the prior on the observation spread
+  real<lower=0> lambda_sd;               // scale of the prior on the decay rates
 
+  // ---- Times at which to report a fitted decay curve, for plotting ---------
   int<lower=0> N_time_sim;
   vector[N_time_sim] time_sim;
 }
 
+
 parameters {
-  vector[N_ik] C0;                 // log-concentration at t = 0, per vessel x marker
-  vector<lower=0>[N_k] lambda;     // decay rate per marker (1/hour, positive)
-  real logC50;                     // log-conc at 50% detection
-  real<lower=0> beta;              // detection slope
-  real<lower=0> sigma_obs;         // observation SD of log-concentration
+  vector[N_ik] C0;                       // starting log concentration, per vessel and marker
+  vector<lower=0>[N_k] lambda;           // decay rate of each marker, per hour
+  real logC50;                           // log concentration at 50% detection
+  real<lower=0> beta;                    // steepness of the detection curve
+  real<lower=0> sigma_obs;               // spread between replicates of one sample
 }
 
+
 transformed parameters {
-  vector[N] mu;
+  vector[N] mu;                          // expected log concentration of each replicate
+
   for (n in 1:N) {
     mu[n] = C0[ik[n]] - lambda[k[n]] * time[n];
   }
 }
 
-model {
-  C0        ~ normal(C0_mean, C0_sd);
-  lambda    ~ normal(0, lambda_sd);
-  logC50    ~ normal(logC50_mean, logC50_sd);
-  beta      ~ normal(beta_mean, beta_sd);
-  sigma_obs ~ normal(0, sigma_sd);
 
-  z     ~ bernoulli_logit(beta * (mu - logC50));
-  y_obs ~ normal(mu[y_row], sigma_obs);
+model {
+  // ---- What we believe before seeing the data ------------------------------
+  C0        ~ normal(C0_mean, C0_sd);
+  lambda    ~ normal(0, lambda_sd);      // half-normal: lambda cannot be negative
+  logC50    ~ normal(logC50_mean, logC50_sd);
+  beta      ~ normal(beta_mean, beta_sd);   // half-normal
+  sigma_obs ~ normal(0, sigma_sd);          // half-normal
+
+  // ---- What the data say ---------------------------------------------------
+  z     ~ bernoulli_logit(beta * (mu - logC50));   // every replicate
+  y_obs ~ normal(mu[y_row], sigma_obs);            // those that detected something
 }
 
+
 generated quantities {
-  vector[N_k] r;                   // decay rate, negative (age-model convention)
-  vector[N_k] half_life;           // hours
-  vector[N_k] C0_bar;              // mean t = 0 log-concentration per marker
-  vector[N_k] p_log;               // t = 0 log offset relative to marker 1
-  vector[N_k] p_ratio;             // the same thing as a concentration ratio
-  matrix[N_time_sim, N_k] C_sim;   // mean decay curve per marker
-  vector[N] log_lik;
-  real alpha = -beta * logC50;
+  vector[N_k] r;                         // decay rates in the age model's convention
+  vector[N_k] half_life;                 // hours for a marker to halve
+  vector[N_k] C0_bar;                    // average starting level of each marker
+  vector[N_k] p_log;                     // starting level relative to marker 1
+  vector[N_k] p_ratio;                   // the same thing as a plain ratio
+  matrix[N_time_sim, N_k] C_sim;         // fitted decay curve, for plotting
+  vector[N] log_lik;                     // fit of each replicate, for model comparison
+  real alpha = -beta * logC50;           // intercept of the same detection curve
 
   r = -lambda;
 
   for (kk in 1:N_k) {
     half_life[kk] = log(2) / lambda[kk];
+
+    // Average the intercepts of every vessel measured for this marker.
     {
       real s = 0;
       int n_ik = 0;
@@ -111,8 +169,11 @@ generated quantities {
   }
 
   for (kk in 1:N_k) {
+    // Offsets are relative, so the first marker is the reference and is zero
+    // by construction.
     p_log[kk]   = C0_bar[kk] - C0_bar[1];
     p_ratio[kk] = exp(p_log[kk]);
+
     for (tt in 1:N_time_sim) {
       C_sim[tt, kk] = C0_bar[kk] - lambda[kk] * time_sim[tt];
     }
@@ -121,8 +182,8 @@ generated quantities {
   {
     vector[N] ll;
     for (n in 1:N) ll[n] = bernoulli_logit_lpmf(z[n] | beta * (mu[n] - logC50));
+    // Replicates that detected something contribute their measurement too.
     for (n in 1:N_y) ll[y_row[n]] += normal_lpdf(y_obs[n] | mu[y_row[n]], sigma_obs);
     log_lik = ll;
   }
 }
-

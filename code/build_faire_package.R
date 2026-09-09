@@ -558,13 +558,13 @@ cat("ampData rows total:", nrow(amp_all), "\n")
 
 has_missing <- function(x) any(!is.na(x) & x == MISSING)
 
-todo <- c(project_meta$term_name[apply(project_meta[, -1], 1, has_missing)],
+incomplete <- c(project_meta$term_name[apply(project_meta[, -1], 1, has_missing)],
           paste0("sampleMetadata: ",
                  paste(names(sample_meta)[sapply(sample_meta, has_missing)],
                        collapse = ", ")))
 
 cat("\nTerms still set to '", MISSING, "':\n", sep = "")
-cat(paste0("  ", todo, collapse = "\n"), "\n")
+cat(paste0("  ", incomplete, collapse = "\n"), "\n")
 if (DECAY_EVENT_DATE == MISSING) {
   cat("\nDECAY_EVENT_DATE is still unset; edit it at the top of this script.\n")
 }
