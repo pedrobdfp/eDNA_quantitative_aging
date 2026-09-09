@@ -1,7 +1,11 @@
 # Quantitative aging of environmental DNA
 
+<<<<<<< HEAD
 Code and data accompanying the manuscript *[Quantitative Aging of Environmental
 DNA Using Multiple Fragment Sizes]*.
+=======
+Code and data accompanying the manuscript *[Quantitative Aging of Environmental DNA Using Multiple Fragment Sizes]*.
+>>>>>>> 7ce674e9df8a174fb6c275616c218f15f2dcf39b
 
 This repository reproduces the figures and parameter estimates in the manuscript
 and provides the model in a form that can be applied to other systems.
