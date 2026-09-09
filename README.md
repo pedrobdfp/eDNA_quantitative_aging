@@ -1,6 +1,6 @@
 # Quantitative aging of environmental DNA
 
-Code and data accompanying the manuscript *[Quantitative aging of environmental DNA using multiple components]*.
+Code and data accompanying the manuscript *[Quantitative Aging of Environmental DNA Using Multiple Fragment Sizes]*.
 
 This repository reproduces every figure and parameter estimate in the manuscript,
 and provides the model in a form you can apply to your own data.
